@@ -103,21 +103,30 @@ pub const Pager = struct {
         return Pager{ .database_file = database_file, .database_file_length = database_file_length, .pages = @splat(null) };
     }
 
-    pub fn deinit(self: *Pager, io: std.Io, allocator: std.mem.Allocator) !void {
-        for (0..MAX_PAGES) |page_num| {
+    pub fn deinit(self: *Pager, io: std.Io, allocator: std.mem.Allocator, num_rows: u32) !void {
+        const num_full_pages = num_rows / ROWS_PER_PAGE;
+
+        for (0..num_full_pages) |page_num| {
             if (self.pages[page_num]) |page| {
                 const offset = page_num * PAGE_SIZE;
-                std.debug.print("Writing to offset - {d} with content - {s}\n", .{ offset, page.* });
-
                 _ = try self.database_file.writePositional(io, &.{page.*[0..]}, offset);
 
                 allocator.destroy(page);
             }
         }
+
+        const additional_rows = num_rows % ROWS_PER_PAGE;
+        if (additional_rows != 0) {
+            if (self.pages[num_full_pages]) |page| {
+                const buffer = page[0 .. additional_rows * ROW_SIZE];
+                _ = try self.database_file.writePositional(io, &.{buffer}, num_full_pages * PAGE_SIZE);
+            }
+        }
+
         self.database_file.close(io);
     }
 
-    pub fn get_page(self: *Pager, allocator: std.mem.Allocator, page_num: u32) !*Page {
+    pub fn get_page(self: *Pager, io: std.Io, allocator: std.mem.Allocator, page_num: u32) !*Page {
         if (page_num > MAX_PAGES) {
             std.debug.print("Cannot fetch beyond max fetch, returning!\n", .{});
             return PagerError.MaxPageExceeded;
@@ -125,6 +134,10 @@ pub const Pager = struct {
 
         const page = self.pages[page_num] orelse {
             const p = try allocator.create(Page);
+
+            const offset = page_num * PAGE_SIZE;
+            _ = try self.database_file.readPositional(io, &.{p}, offset);
+
             self.pages[page_num] = p;
             return p;
         };
@@ -140,20 +153,22 @@ pub const Table = struct {
 
     pub fn init(io: std.Io, path: []const u8) !Table {
         const pager = try Pager.init(io, path);
+        const num_rows = pager.database_file_length / ROW_SIZE;
+
         return Table{
             .pager = pager,
             .pages = @splat(null),
-            .num_rows = 0,
+            .num_rows = @intCast(num_rows),
         };
     }
 
     pub fn deinit(self: *Table, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.pager.deinit(io, allocator);
+        try self.pager.deinit(io, allocator, self.num_rows);
     }
 
-    pub fn row_slot(self: *Table, allocator: std.mem.Allocator, row_num: u32) ![]u8 {
+    pub fn row_slot(self: *Table, io: std.Io, allocator: std.mem.Allocator, row_num: u32) ![]u8 {
         const page_num: u32 = row_num / ROWS_PER_PAGE;
-        const page = try self.pager.get_page(allocator, page_num);
+        const page = try self.pager.get_page(io, allocator, page_num);
 
         const row_offset = row_num % ROWS_PER_PAGE;
         const byte_offset = row_offset * ROW_SIZE; // Get the offset to the row within the page.
@@ -163,20 +178,20 @@ pub const Table = struct {
         return remaining_page[0..ROW_SIZE];
     }
 
-    pub fn execute_statement(self: *Table, statement: *Statement, allocator: std.mem.Allocator) !ExecuteResult {
+    pub fn execute_statement(self: *Table, io: std.Io, allocator: std.mem.Allocator, statement: *Statement) !ExecuteResult {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
                 if (self.num_rows > TABLE_MAX_ROWS) {
                     return ExecuteResult.EXECUTE_TABLE_FULL;
                 }
 
-                const slot = try self.row_slot(allocator, self.num_rows);
+                const slot = try self.row_slot(io, allocator, self.num_rows);
                 try serialize_row(&statement.row_to_insert, slot);
                 self.num_rows += 1;
             },
             StatementType.STATEMENT_SELECT => {
                 for (0..self.num_rows) |i| {
-                    const slot = try self.row_slot(allocator, @intCast(i));
+                    const slot = try self.row_slot(io, allocator, @intCast(i));
                     const row = try deserialize_row(slot);
                     std.debug.print("Row - {d}, {s}, {s}\n", .{ row.id, row.username, row.email });
                 }
@@ -266,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
             var statement: Statement = .{ .statement_type = undefined, .row_to_insert = undefined };
             switch (statement.prepare_statement(trimmed)) {
                 PrepareResult.PREPARE_SUCCESS => {
-                    switch (try table.execute_statement(&statement, allocator)) {
+                    switch (try table.execute_statement(io, allocator, &statement)) {
                         ExecuteResult.EXECUTE_SUCCESS => {},
                         ExecuteResult.EXECUTE_TABLE_FULL => {
                             try stdout_writer.print("ERROR: Reached max table size", .{});
