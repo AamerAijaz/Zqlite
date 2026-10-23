@@ -7,10 +7,14 @@ const ROW_SIZE = @sizeOf(Row);
 const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS = ROWS_PER_PAGE * MAX_PAGES;
 
-const MetaCommandResult = enum { META_COMMAND_SUCCESS, META_COMMAND_UNRECOGNIZED_COMMAND };
+const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND };
 const PrepareResult = enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_INVALID_INSERT };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 const ExecuteResult = enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL };
+
+pub const PagerError = error{
+    MaxPageExceeded,
+};
 
 pub const Row = extern struct {
     id: u32,
@@ -84,31 +88,79 @@ pub const Statement = struct {
 };
 
 pub const Page = [PAGE_SIZE]u8;
-pub const Table = struct {
-    num_rows: u32 = 0,
-    pages: [MAX_PAGES]?*Page = @splat(null),
+pub const Pager = struct {
+    database_file: std.Io.File,
+    database_file_length: u64,
+    pages: [MAX_PAGES]?*Page = @splat(null), // An in-memory cache of the pages fetched or inserted.
 
-    pub fn deinit(self: *Table, allocator: std.mem.Allocator) void {
-        for (self.pages) |maybe_page| {
-            if (maybe_page) |page| {
+    pub fn init(io: std.Io, path: []const u8) !Pager {
+        const database_file = try std.Io.Dir.openFile(std.Io.Dir.cwd(), io, path, .{
+            .mode = .read_write,
+        });
+
+        const database_file_length = try database_file.length(io);
+
+        return Pager{ .database_file = database_file, .database_file_length = database_file_length, .pages = @splat(null) };
+    }
+
+    pub fn deinit(self: *Pager, io: std.Io, allocator: std.mem.Allocator) !void {
+        for (0..MAX_PAGES) |page_num| {
+            if (self.pages[page_num]) |page| {
+                const offset = page_num * PAGE_SIZE;
+                std.debug.print("Writing to offset - {d} with content - {s}\n", .{ offset, page.* });
+
+                _ = try self.database_file.writePositional(io, &.{page.*[0..]}, offset);
+
                 allocator.destroy(page);
             }
         }
+        self.database_file.close(io);
     }
 
-    pub fn row_slot(self: *Table, row_num: u32, allocator: std.mem.Allocator) ![]u8 {
-        const page_num: u32 = row_num / ROWS_PER_PAGE;
-        if (self.pages[page_num] == null) {
-            const p = try allocator.create(Page);
-            self.pages[page_num] = p;
+    pub fn get_page(self: *Pager, allocator: std.mem.Allocator, page_num: u32) !*Page {
+        if (page_num > MAX_PAGES) {
+            std.debug.print("Cannot fetch beyond max fetch, returning!\n", .{});
+            return PagerError.MaxPageExceeded;
         }
 
-        const row_offset = row_num % ROWS_PER_PAGE;
-        const byte_offset = row_offset * ROW_SIZE;
-        const page = self.pages[page_num].?[byte_offset..];
+        const page = self.pages[page_num] orelse {
+            const p = try allocator.create(Page);
+            self.pages[page_num] = p;
+            return p;
+        };
 
-        std.debug.assert(page.len > ROW_SIZE);
-        return page[0..ROW_SIZE];
+        return page;
+    }
+};
+
+pub const Table = struct {
+    num_rows: u32 = 0,
+    pages: [MAX_PAGES]?*Page = @splat(null),
+    pager: Pager,
+
+    pub fn init(io: std.Io, path: []const u8) !Table {
+        const pager = try Pager.init(io, path);
+        return Table{
+            .pager = pager,
+            .pages = @splat(null),
+            .num_rows = 0,
+        };
+    }
+
+    pub fn deinit(self: *Table, io: std.Io, allocator: std.mem.Allocator) !void {
+        try self.pager.deinit(io, allocator);
+    }
+
+    pub fn row_slot(self: *Table, allocator: std.mem.Allocator, row_num: u32) ![]u8 {
+        const page_num: u32 = row_num / ROWS_PER_PAGE;
+        const page = try self.pager.get_page(allocator, page_num);
+
+        const row_offset = row_num % ROWS_PER_PAGE;
+        const byte_offset = row_offset * ROW_SIZE; // Get the offset to the row within the page.
+        const remaining_page = page[byte_offset..];
+
+        std.debug.assert(remaining_page.len >= ROW_SIZE);
+        return remaining_page[0..ROW_SIZE];
     }
 
     pub fn execute_statement(self: *Table, statement: *Statement, allocator: std.mem.Allocator) !ExecuteResult {
@@ -118,13 +170,13 @@ pub const Table = struct {
                     return ExecuteResult.EXECUTE_TABLE_FULL;
                 }
 
-                const slot = try self.row_slot(self.num_rows, allocator);
+                const slot = try self.row_slot(allocator, self.num_rows);
                 try serialize_row(&statement.row_to_insert, slot);
                 self.num_rows += 1;
             },
             StatementType.STATEMENT_SELECT => {
                 for (0..self.num_rows) |i| {
-                    const slot = try self.row_slot(@intCast(i), allocator);
+                    const slot = try self.row_slot(allocator, @intCast(i));
                     const row = try deserialize_row(slot);
                     std.debug.print("Row - {d}, {s}, {s}\n", .{ row.id, row.username, row.email });
                 }
@@ -147,14 +199,28 @@ pub fn deserialize_row(source: []u8) !Row {
 
 pub fn do_meta_command(line: []const u8) MetaCommandResult {
     if (std.mem.eql(u8, line, ".exit")) {
-        std.process.exit(0);
+        return MetaCommandResult.META_COMMAND_EXIT;
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
     }
 }
 
+pub fn open_database(io: std.Io, path: []const u8) !Table {
+    return try .init(io, path);
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+
+    var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
+    defer args.deinit();
+
+    _ = args.next();
+    const database_path = args.next();
+    if (database_path == null) {
+        std.debug.print("Valid database path required.\n", .{});
+        return;
+    }
 
     // Stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
@@ -167,11 +233,13 @@ pub fn main(init: std.process.Init) !void {
     var stdin_file_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
     const stdin_reader = &stdin_file_reader.interface;
 
-    var table: Table = .{};
+    var table: Table = try Table.init(io, "database.db");
+
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
-
-    defer table.deinit(allocator);
+    defer table.deinit(io, allocator) catch |err| {
+        std.debug.print("Failed to deinitialize the table: {}\n", .{err});
+    };
 
     while (true) {
         try stdout_writer.print("zqlite> ", .{});
@@ -186,33 +254,35 @@ pub fn main(init: std.process.Init) !void {
 
         if (trimmed[0] == '.') {
             switch (do_meta_command(trimmed)) {
-                MetaCommandResult.META_COMMAND_SUCCESS => {},
+                MetaCommandResult.META_COMMAND_EXIT => {
+                    return;
+                },
                 MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND => {
                     try stdout_writer.print("Unrecognized Command {s}", .{trimmed});
                     try stdout_writer.flush();
                 },
             }
-        }
-
-        var statement: Statement = .{ .statement_type = undefined, .row_to_insert = undefined };
-        switch (statement.prepare_statement(trimmed)) {
-            PrepareResult.PREPARE_SUCCESS => {
-                switch (try table.execute_statement(&statement, allocator)) {
-                    ExecuteResult.EXECUTE_SUCCESS => {},
-                    ExecuteResult.EXECUTE_TABLE_FULL => {
-                        try stdout_writer.print("ERROR: Reached max table size", .{});
-                        try stdout_writer.flush();
-                    },
-                }
-            },
-            PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT => {
-                try stdout_writer.print("Unrecognized keyword at the start {s}", .{trimmed});
-                try stdout_writer.flush();
-            },
-            PrepareResult.PREPARE_INVALID_INSERT => {
-                try stdout_writer.print("Syntax error. Could not parse statement", .{});
-                try stdout_writer.flush();
-            },
+        } else {
+            var statement: Statement = .{ .statement_type = undefined, .row_to_insert = undefined };
+            switch (statement.prepare_statement(trimmed)) {
+                PrepareResult.PREPARE_SUCCESS => {
+                    switch (try table.execute_statement(&statement, allocator)) {
+                        ExecuteResult.EXECUTE_SUCCESS => {},
+                        ExecuteResult.EXECUTE_TABLE_FULL => {
+                            try stdout_writer.print("ERROR: Reached max table size", .{});
+                            try stdout_writer.flush();
+                        },
+                    }
+                },
+                PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT => {
+                    try stdout_writer.print("Unrecognized keyword at the start {s}", .{trimmed});
+                    try stdout_writer.flush();
+                },
+                PrepareResult.PREPARE_INVALID_INSERT => {
+                    try stdout_writer.print("Syntax error. Could not parse statement", .{});
+                    try stdout_writer.flush();
+                },
+            }
         }
 
         try stdout_writer.print("\n", .{});
