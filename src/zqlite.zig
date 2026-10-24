@@ -166,18 +166,6 @@ pub const Table = struct {
         try self.pager.deinit(io, allocator, self.num_rows);
     }
 
-    pub fn row_slot(self: *Table, io: std.Io, allocator: std.mem.Allocator, row_num: u32) ![]u8 {
-        const page_num: u32 = row_num / ROWS_PER_PAGE;
-        const page = try self.pager.get_page(io, allocator, page_num);
-
-        const row_offset = row_num % ROWS_PER_PAGE;
-        const byte_offset = row_offset * ROW_SIZE; // Get the offset to the row within the page.
-        const remaining_page = page[byte_offset..];
-
-        std.debug.assert(remaining_page.len >= ROW_SIZE);
-        return remaining_page[0..ROW_SIZE];
-    }
-
     pub fn execute_statement(self: *Table, io: std.Io, allocator: std.mem.Allocator, statement: *Statement) !ExecuteResult {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
@@ -185,21 +173,65 @@ pub const Table = struct {
                     return ExecuteResult.EXECUTE_TABLE_FULL;
                 }
 
-                const slot = try self.row_slot(io, allocator, self.num_rows);
-                try serialize_row(&statement.row_to_insert, slot);
+                var cursor = Cursor.end(self);
+                try serialize_row(&statement.row_to_insert, try cursor.value(io, allocator));
                 self.num_rows += 1;
             },
             StatementType.STATEMENT_SELECT => {
-                for (0..self.num_rows) |i| {
-                    const slot = try self.row_slot(io, allocator, @intCast(i));
-                    const row = try deserialize_row(slot);
+                var cursor = Cursor.start(self);
+                while (cursor.end_of_table == false) {
+                    const row = try deserialize_row(try cursor.value(io, allocator));
                     std.debug.print("Row - {d}, {s}, {s}\n", .{ row.id, row.username, row.email });
+                    cursor.advance();
                 }
             },
         }
 
         std.debug.print("Executed", .{});
         return ExecuteResult.EXECUTE_SUCCESS;
+    }
+};
+
+pub const Cursor = struct {
+    table: *Table,
+    row_num: u32,
+    end_of_table: bool,
+
+    /// Returns a cursor at the start of the table.
+    pub fn start(table: *Table) Cursor {
+        return Cursor{
+            .table = table,
+            .row_num = 0,
+            .end_of_table = table.num_rows == 0,
+        };
+    }
+
+    /// Returns a cursor at the end of the table.
+    pub fn end(table: *Table) Cursor {
+        return Cursor{
+            .table = table,
+            .row_num = table.num_rows,
+            .end_of_table = true,
+        };
+    }
+
+    /// Returns the row in bytes present at the current cursor position.
+    pub fn value(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+        const page_num: u32 = self.row_num / ROWS_PER_PAGE;
+        const page = try self.table.pager.get_page(io, allocator, page_num);
+
+        const row_offset = self.row_num % ROWS_PER_PAGE;
+        const byte_offset = row_offset * ROW_SIZE; // Get the offset to the row within the page.
+        const remaining_page = page[byte_offset..];
+
+        std.debug.assert(remaining_page.len >= ROW_SIZE);
+        return remaining_page[0..ROW_SIZE];
+    }
+
+    /// advances the cursor by 1 row.
+    pub fn advance(self: *Cursor) void {
+        self.row_num += 1;
+        self.end_of_table = self.row_num >= self.table.num_rows;
     }
 };
 
