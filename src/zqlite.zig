@@ -7,13 +7,42 @@ const ROW_SIZE = @sizeOf(Row);
 const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS = ROWS_PER_PAGE * MAX_PAGES;
 
+// Common Node Header Layout.
+const NODE_TYPE_SIZE = @sizeOf(u8);
+const NODE_TYPE_OFFSET = 0;
+const IS_ROOT_SIZE = @sizeOf(u8);
+const IS_ROOT_OFFSET = NODE_TYPE_SIZE + NODE_TYPE_OFFSET;
+const PARENT_POINTER_SIZE = @sizeOf(u32);
+const PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+// Leaf Node Header Layout.
+const LEAF_NODE_NUM_CELLS_SIZE = @sizeOf(u32);
+const LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+// Lead Node Body Layout.
+const LEAF_NODE_KEY_SIZE = @sizeOf(u32);
+const LEAF_NODE_KEY_OFFSET = 0;
+const LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
 const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND };
 const PrepareResult = enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_INVALID_INSERT };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 const ExecuteResult = enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL };
+const NodeType = enum(u8) { NODE_LEAF, NODE_INTERNAL };
 
 pub const PagerError = error{
     MaxPageExceeded,
+    InvalidDatabaseFileLength,
+};
+
+const CursorError = error{
+    UnimplementedNodeSplitting,
 };
 
 pub const Row = extern struct {
@@ -87,10 +116,76 @@ pub const Statement = struct {
     }
 };
 
+pub const Node = struct {
+    buffer: []u8,
+
+    pub fn init(buffer: []u8) Node {
+        return Node{ .buffer = buffer };
+    }
+
+    /// Sets the num_cells of a node to be 0.
+    pub fn reset(self: *Node) void {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
+        const num_cells_buffer = self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE];
+        @memset(num_cells_buffer, 0);
+    }
+
+    pub fn get_node_type(self: *const Node) NodeType {
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        return @bitCast(self.buffer[NODE_TYPE_OFFSET .. NODE_TYPE_OFFSET + NODE_TYPE_SIZE].*);
+    }
+
+    pub fn is_root(self: *const Node) bool {
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        return !std.mem.allEqual(u8, self.buffer[IS_ROOT_OFFSET .. IS_ROOT_OFFSET + IS_ROOT_SIZE], 0);
+    }
+
+    pub fn get_num_cells(self: *const Node) u32 {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
+        return @bitCast(self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE].*);
+    }
+
+    pub fn set_num_cells(self: *Node, num_cells: u32) void {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
+        const destination = self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE];
+        @memcpy(destination, std.mem.asBytes(&num_cells));
+    }
+
+    pub fn get_cell(self: *const Node, cell_num: u32) []u8 {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+
+        const start_position = LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+        const end_position = LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE;
+        return self.buffer[start_position .. end_position + 1];
+    }
+
+    pub fn get_cell_key(self: *const Node, cell_num: u32) []u8 {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+        const cell = self.get_cell(cell_num);
+        return cell[0..LEAF_NODE_KEY_SIZE];
+    }
+
+    pub fn set_cell_key(self: *Node, cell_num: u32, key: u32) void {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+        const cell_key = self.get_cell_key(cell_num);
+        @memcpy(cell_key, std.mem.asBytes(&key));
+    }
+
+    pub fn get_cell_value(self: *const Node, cell_num: u32) []u8 {
+        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+
+        const cell = self.get_cell(cell_num);
+        std.debug.assert(cell.len >= LEAF_NODE_VALUE_OFFSET + LEAF_NODE_VALUE_SIZE);
+
+        return cell[LEAF_NODE_VALUE_OFFSET .. LEAF_NODE_VALUE_OFFSET + LEAF_NODE_VALUE_SIZE];
+    }
+};
+
 pub const Page = [PAGE_SIZE]u8;
 pub const Pager = struct {
     database_file: std.Io.File,
     database_file_length: u64,
+    num_pages: u32,
     pages: [MAX_PAGES]?*Page = @splat(null), // An in-memory cache of the pages fetched or inserted.
 
     pub fn init(io: std.Io, path: []const u8) !Pager {
@@ -99,27 +194,27 @@ pub const Pager = struct {
         });
 
         const database_file_length = try database_file.length(io);
+        const num_pages = database_file_length / PAGE_SIZE;
 
-        return Pager{ .database_file = database_file, .database_file_length = database_file_length, .pages = @splat(null) };
+        if (database_file_length % PAGE_SIZE != 0) {
+            return PagerError.InvalidDatabaseFileLength;
+        }
+
+        return Pager{
+            .database_file = database_file,
+            .database_file_length = database_file_length,
+            .pages = @splat(null),
+            .num_pages = @intCast(num_pages),
+        };
     }
 
-    pub fn deinit(self: *Pager, io: std.Io, allocator: std.mem.Allocator, num_rows: u32) !void {
-        const num_full_pages = num_rows / ROWS_PER_PAGE;
-
-        for (0..num_full_pages) |page_num| {
+    pub fn deinit(self: *Pager, io: std.Io, allocator: std.mem.Allocator) !void {
+        for (0..self.num_pages + 1) |page_num| {
             if (self.pages[page_num]) |page| {
                 const offset = page_num * PAGE_SIZE;
                 _ = try self.database_file.writePositional(io, &.{page.*[0..]}, offset);
 
                 allocator.destroy(page);
-            }
-        }
-
-        const additional_rows = num_rows % ROWS_PER_PAGE;
-        if (additional_rows != 0) {
-            if (self.pages[num_full_pages]) |page| {
-                const buffer = page[0 .. additional_rows * ROW_SIZE];
-                _ = try self.database_file.writePositional(io, &.{buffer}, num_full_pages * PAGE_SIZE);
             }
         }
 
@@ -148,41 +243,51 @@ pub const Pager = struct {
 
 pub const Table = struct {
     num_rows: u32 = 0,
-    pages: [MAX_PAGES]?*Page = @splat(null),
     pager: Pager,
+    root_page_num: u32 = 0,
 
-    pub fn init(io: std.Io, path: []const u8) !Table {
-        const pager = try Pager.init(io, path);
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Table {
+        var pager = try Pager.init(io, path);
         const num_rows = pager.database_file_length / ROW_SIZE;
+
+        // Initialize the root_node if it is a new table.
+        if (pager.num_pages == 0) {
+            const root_node_page = try pager.get_page(io, allocator, 0);
+            var root_node = Node.init(root_node_page);
+            root_node.reset();
+        }
 
         return Table{
             .pager = pager,
-            .pages = @splat(null),
+            .root_page_num = 0,
             .num_rows = @intCast(num_rows),
         };
     }
 
     pub fn deinit(self: *Table, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.pager.deinit(io, allocator, self.num_rows);
+        try self.pager.deinit(io, allocator);
     }
 
     pub fn execute_statement(self: *Table, io: std.Io, allocator: std.mem.Allocator, statement: *Statement) !ExecuteResult {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
-                if (self.num_rows > TABLE_MAX_ROWS) {
+                const page = try self.pager.get_page(io, allocator, self.root_page_num);
+                const root_node = Node.init(page);
+                if (root_node.get_num_cells() >= LEAF_NODE_MAX_CELLS) {
                     return ExecuteResult.EXECUTE_TABLE_FULL;
                 }
 
-                var cursor = Cursor.end(self);
-                try serialize_row(&statement.row_to_insert, try cursor.value(io, allocator));
+                var cursor = try Cursor.end(self, io, allocator);
+                try cursor.insert_row(io, allocator, statement.row_to_insert.id, &statement.row_to_insert);
+
                 self.num_rows += 1;
             },
             StatementType.STATEMENT_SELECT => {
-                var cursor = Cursor.start(self);
+                var cursor = try Cursor.start(self, io, allocator);
                 while (cursor.end_of_table == false) {
                     const row = try deserialize_row(try cursor.value(io, allocator));
                     std.debug.print("Row - {d}, {s}, {s}\n", .{ row.id, row.username, row.email });
-                    cursor.advance();
+                    try cursor.advance(io, allocator);
                 }
             },
         }
@@ -194,48 +299,76 @@ pub const Table = struct {
 
 pub const Cursor = struct {
     table: *Table,
-    row_num: u32,
+    page_num: u32,
+    cell_num: u32,
     end_of_table: bool,
 
     /// Returns a cursor at the start of the table.
-    pub fn start(table: *Table) Cursor {
+    pub fn start(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
+        const page = try table.pager.get_page(io, allocator, table.root_page_num);
+        const root_node = Node.init(page);
+
         return Cursor{
             .table = table,
-            .row_num = 0,
-            .end_of_table = table.num_rows == 0,
+            .page_num = table.root_page_num,
+            .cell_num = 0,
+            .end_of_table = root_node.get_num_cells() == 0,
         };
     }
 
     /// Returns a cursor at the end of the table.
-    pub fn end(table: *Table) Cursor {
+    pub fn end(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
+        const page = try table.pager.get_page(io, allocator, table.root_page_num);
+        const node = Node.init(page);
+
         return Cursor{
             .table = table,
-            .row_num = table.num_rows,
+            .page_num = table.root_page_num,
+            .cell_num = node.get_num_cells(),
             .end_of_table = true,
         };
     }
 
-    /// Returns the row in bytes present at the current cursor position.
+    /// Returns the current cell in bytes present at the current cursor position.
     pub fn value(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
-        const page_num: u32 = self.row_num / ROWS_PER_PAGE;
-        const page = try self.table.pager.get_page(io, allocator, page_num);
-
-        const row_offset = self.row_num % ROWS_PER_PAGE;
-        const byte_offset = row_offset * ROW_SIZE; // Get the offset to the row within the page.
-        const remaining_page = page[byte_offset..];
-
-        std.debug.assert(remaining_page.len >= ROW_SIZE);
-        return remaining_page[0..ROW_SIZE];
+        const page = try self.table.pager.get_page(io, allocator, self.page_num);
+        const node = Node.init(page);
+        return node.get_cell_value(self.cell_num);
     }
 
-    /// advances the cursor by 1 row.
-    pub fn advance(self: *Cursor) void {
-        self.row_num += 1;
-        self.end_of_table = self.row_num >= self.table.num_rows;
+    /// advances the cursor to the next cell in the page.
+    pub fn advance(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) !void {
+        const page = try self.table.pager.get_page(io, allocator, self.page_num);
+        const node = Node.init(page);
+
+        self.cell_num += 1;
+        self.end_of_table = self.cell_num >= node.get_num_cells();
+    }
+
+    pub fn insert_row(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, key: u32, row: *Row) !void {
+        const page = try self.table.pager.get_page(io, allocator, self.page_num);
+        var node = Node.init(page);
+        const num_cells = node.get_num_cells();
+
+        if (num_cells >= LEAF_NODE_MAX_CELLS) {
+            std.debug.print("Need to implement splitting a full node", .{});
+            return CursorError.UnimplementedNodeSplitting;
+        }
+
+        if (self.cell_num < num_cells) {
+            var cell_num = num_cells;
+            while (cell_num > self.cell_num) : (cell_num -= 1) {
+                @memcpy(node.get_cell(cell_num), node.get_cell(cell_num - 1));
+            }
+        }
+
+        node.set_num_cells(num_cells + 1);
+        node.set_cell_key(self.cell_num, key);
+        serialize_row(row, node.get_cell_value(self.cell_num));
     }
 };
 
-pub fn serialize_row(row: *Row, destination: []u8) !void {
+pub fn serialize_row(row: *Row, destination: []u8) void {
     @memcpy(destination, std.mem.asBytes(row));
 }
 
@@ -280,10 +413,10 @@ pub fn main(init: std.process.Init) !void {
     var stdin_file_reader = Io.File.Reader.init(.stdin(), io, &stdin_buffer);
     const stdin_reader = &stdin_file_reader.interface;
 
-    var table: Table = try Table.init(io, "database.db");
-
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
+
+    var table: Table = try Table.init(io, allocator, database_path.?);
     defer table.deinit(io, allocator) catch |err| {
         std.debug.print("Failed to deinitialize the table: {}\n", .{err});
     };
