@@ -411,7 +411,7 @@ pub const Cursor = struct {
         if (self.cell_num < num_cells) {
             var cell_num = num_cells;
             while (cell_num > self.cell_num) : (cell_num -= 1) {
-                @memcpy(node.get_cell(cell_num), node.get_cell(cell_num - 1));
+                @memmove(node.get_cell(cell_num), node.get_cell(cell_num - 1));
             }
         }
 
