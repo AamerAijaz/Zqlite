@@ -4,8 +4,6 @@ const Io = std.Io;
 const MAX_PAGES = 100;
 const PAGE_SIZE = 4096;
 const ROW_SIZE = @sizeOf(Row);
-const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS = ROWS_PER_PAGE * MAX_PAGES;
 
 // Common Node Header Layout.
 const NODE_TYPE_SIZE = @sizeOf(u8);
@@ -239,28 +237,29 @@ pub const Pager = struct {
 
         return page;
     }
+
+    pub fn get_node(self: *Pager, io: std.Io, allocator: std.mem.Allocator, page_num: u32) !Node {
+        const page = try self.get_page(io, allocator, page_num);
+        return Node.init(page);
+    }
 };
 
 pub const Table = struct {
-    num_rows: u32 = 0,
     pager: Pager,
     root_page_num: u32 = 0,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Table {
         var pager = try Pager.init(io, path);
-        const num_rows = pager.database_file_length / ROW_SIZE;
 
         // Initialize the root_node if it is a new table.
         if (pager.num_pages == 0) {
-            const root_node_page = try pager.get_page(io, allocator, 0);
-            var root_node = Node.init(root_node_page);
+            var root_node = pager.get_node(io, allocator, 0);
             root_node.reset();
         }
 
         return Table{
             .pager = pager,
             .root_page_num = 0,
-            .num_rows = @intCast(num_rows),
         };
     }
 
@@ -271,16 +270,13 @@ pub const Table = struct {
     pub fn execute_statement(self: *Table, io: std.Io, allocator: std.mem.Allocator, statement: *Statement) !ExecuteResult {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
-                const page = try self.pager.get_page(io, allocator, self.root_page_num);
-                const root_node = Node.init(page);
+                const root_node = try self.pager.get_node(io, allocator, self.root_page_num);
                 if (root_node.get_num_cells() >= LEAF_NODE_MAX_CELLS) {
                     return ExecuteResult.EXECUTE_TABLE_FULL;
                 }
 
                 var cursor = try Cursor.end(self, io, allocator);
                 try cursor.insert_row(io, allocator, statement.row_to_insert.id, &statement.row_to_insert);
-
-                self.num_rows += 1;
             },
             StatementType.STATEMENT_SELECT => {
                 var cursor = try Cursor.start(self, io, allocator);
@@ -305,8 +301,7 @@ pub const Cursor = struct {
 
     /// Returns a cursor at the start of the table.
     pub fn start(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
-        const page = try table.pager.get_page(io, allocator, table.root_page_num);
-        const root_node = Node.init(page);
+        const root_node = try table.pager.get_node(io, allocator, table.root_page_num);
 
         return Cursor{
             .table = table,
@@ -318,8 +313,7 @@ pub const Cursor = struct {
 
     /// Returns a cursor at the end of the table.
     pub fn end(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
-        const page = try table.pager.get_page(io, allocator, table.root_page_num);
-        const node = Node.init(page);
+        const node = try table.pager.get_node(io, allocator, table.root_page_num);
 
         return Cursor{
             .table = table,
@@ -331,23 +325,20 @@ pub const Cursor = struct {
 
     /// Returns the current cell in bytes present at the current cursor position.
     pub fn value(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
-        const page = try self.table.pager.get_page(io, allocator, self.page_num);
-        const node = Node.init(page);
+        const node = try self.table.pager.get_node(io, allocator, self.page_num);
         return node.get_cell_value(self.cell_num);
     }
 
     /// advances the cursor to the next cell in the page.
     pub fn advance(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) !void {
-        const page = try self.table.pager.get_page(io, allocator, self.page_num);
-        const node = Node.init(page);
+        const node = try self.table.pager.get_node(io, allocator, self.page_num);
 
         self.cell_num += 1;
         self.end_of_table = self.cell_num >= node.get_num_cells();
     }
 
     pub fn insert_row(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, key: u32, row: *Row) !void {
-        const page = try self.table.pager.get_page(io, allocator, self.page_num);
-        var node = Node.init(page);
+        var node = try self.table.pager.get_node(io, allocator, self.page_num);
         const num_cells = node.get_num_cells();
 
         if (num_cells >= LEAF_NODE_MAX_CELLS) {
