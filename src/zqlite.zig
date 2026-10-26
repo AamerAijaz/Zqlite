@@ -31,8 +31,13 @@ const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND };
 const PrepareResult = enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_INVALID_INSERT };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
-const ExecuteResult = enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL };
+const ExecuteResult = enum { EXECUTE_SUCCESS };
 const NodeType = enum(u8) { NODE_LEAF, NODE_INTERNAL };
+
+pub const ExecuteError = error{
+    TableFull,
+    DuplicateKey,
+};
 
 pub const PagerError = error{
     MaxPageExceeded,
@@ -121,16 +126,22 @@ pub const Node = struct {
         return Node{ .buffer = buffer };
     }
 
-    /// Sets the num_cells of a node to be 0.
-    pub fn reset(self: *Node) void {
-        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
-        const num_cells_buffer = self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE];
-        @memset(num_cells_buffer, 0);
+    /// Initializes a node as a leaf_node.
+    pub fn initialize_leaf_node(self: *Node) void {
+        self.set_num_cells(0);
+        self.set_node_type(NodeType.NODE_LEAF);
     }
 
     pub fn get_node_type(self: *const Node) NodeType {
         std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
         return @bitCast(self.buffer[NODE_TYPE_OFFSET .. NODE_TYPE_OFFSET + NODE_TYPE_SIZE].*);
+    }
+
+    pub fn set_node_type(self: *Node, node_type: NodeType) void {
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        const destination = self.buffer[NODE_TYPE_OFFSET .. NODE_TYPE_OFFSET + NODE_TYPE_SIZE];
+        const source: u8 = @backingInt(node_type);
+        @memcpy(destination, (&source)[0..1]);
     }
 
     pub fn is_root(self: *const Node) bool {
@@ -161,6 +172,11 @@ pub const Node = struct {
         std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
         const cell = self.get_cell(cell_num);
         return cell[0..LEAF_NODE_KEY_SIZE];
+    }
+
+    pub fn get_cell_key_value(self: *const Node, cell_num: u32) u32 {
+        const cell_key = self.get_cell_key(cell_num);
+        return std.mem.readInt(u32, cell_key[0..4], .little);
     }
 
     pub fn set_cell_key(self: *Node, cell_num: u32, key: u32) void {
@@ -253,8 +269,8 @@ pub const Table = struct {
 
         // Initialize the root_node if it is a new table.
         if (pager.num_pages == 0) {
-            var root_node = pager.get_node(io, allocator, 0);
-            root_node.reset();
+            var root_node = try pager.get_node(io, allocator, 0);
+            root_node.initialize_leaf_node();
         }
 
         return Table{
@@ -271,11 +287,22 @@ pub const Table = struct {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
                 const root_node = try self.pager.get_node(io, allocator, self.root_page_num);
-                if (root_node.get_num_cells() >= LEAF_NODE_MAX_CELLS) {
-                    return ExecuteResult.EXECUTE_TABLE_FULL;
+                const num_cells = root_node.get_num_cells();
+                if (num_cells >= LEAF_NODE_MAX_CELLS) {
+                    return ExecuteError.TableFull;
                 }
 
-                var cursor = try Cursor.end(self, io, allocator);
+                const row = &statement.row_to_insert;
+                var cursor = try Cursor.find(self, io, allocator, row.id);
+
+                if (cursor.cell_num < num_cells) {
+                    const node = try cursor.table.pager.get_node(io, allocator, cursor.page_num);
+                    const cell_key = node.get_cell_key_value(cursor.cell_num);
+                    if (cell_key == row.id) {
+                        return ExecuteError.DuplicateKey;
+                    }
+                }
+
                 try cursor.insert_row(io, allocator, statement.row_to_insert.id, &statement.row_to_insert);
             },
             StatementType.STATEMENT_SELECT => {
@@ -323,6 +350,41 @@ pub const Cursor = struct {
         };
     }
 
+    pub fn find(table: *Table, io: std.Io, allocator: std.mem.Allocator, key: u32) !Cursor {
+        var cursor = try Cursor.start(table, io, allocator);
+        var root_node = try cursor.table.pager.get_node(io, allocator, table.root_page_num);
+
+        if (root_node.get_node_type() == NodeType.NODE_LEAF) {
+            try cursor.find_in_leaf_node(root_node, key);
+        } else {
+            std.debug.print("Searching in internal nodes is not implemented yet!", .{});
+            return CursorError.UnimplementedNodeSplitting;
+        }
+
+        return cursor;
+    }
+
+    pub fn find_in_leaf_node(self: *Cursor, node: Node, key: u32) !void {
+        var min_index: u32 = 0;
+        var one_past_max_index = node.get_num_cells();
+
+        while (min_index != one_past_max_index) {
+            const index = (min_index + one_past_max_index) / 2;
+            const cell_key = node.get_cell_key_value(index);
+
+            if (cell_key == key) {
+                self.cell_num = index;
+                return;
+            } else if (cell_key > key) {
+                one_past_max_index = index;
+            } else {
+                min_index = index + 1;
+            }
+        }
+
+        self.cell_num = min_index;
+    }
+
     /// Returns the current cell in bytes present at the current cursor position.
     pub fn value(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
         const node = try self.table.pager.get_node(io, allocator, self.page_num);
@@ -337,7 +399,7 @@ pub const Cursor = struct {
         self.end_of_table = self.cell_num >= node.get_num_cells();
     }
 
-    pub fn insert_row(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, key: u32, row: *Row) !void {
+    pub fn insert_row(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, key: u32, row: *const Row) !void {
         var node = try self.table.pager.get_node(io, allocator, self.page_num);
         const num_cells = node.get_num_cells();
 
@@ -359,7 +421,7 @@ pub const Cursor = struct {
     }
 };
 
-pub fn serialize_row(row: *Row, destination: []u8) void {
+pub fn serialize_row(row: *const Row, destination: []u8) void {
     @memcpy(destination, std.mem.asBytes(row));
 }
 
@@ -437,13 +499,22 @@ pub fn main(init: std.process.Init) !void {
             var statement: Statement = .{ .statement_type = undefined, .row_to_insert = undefined };
             switch (statement.prepare_statement(trimmed)) {
                 PrepareResult.PREPARE_SUCCESS => {
-                    switch (try table.execute_statement(io, allocator, &statement)) {
-                        ExecuteResult.EXECUTE_SUCCESS => {},
-                        ExecuteResult.EXECUTE_TABLE_FULL => {
-                            try stdout_writer.print("ERROR: Reached max table size", .{});
-                            try stdout_writer.flush();
-                        },
-                    }
+                    _ = table.execute_statement(io, allocator, &statement) catch |err| {
+                        switch (err) {
+                            ExecuteError.TableFull => {
+                                try stdout_writer.print("ERROR: Reached max table size", .{});
+                                try stdout_writer.flush();
+                            },
+                            ExecuteError.DuplicateKey => {
+                                try stdout_writer.print("ERROR: Cannot insert a duplicate key", .{});
+                                try stdout_writer.flush();
+                            },
+                            else => {
+                                try stdout_writer.print("ERROR: Unable to execute statement: {any}", .{err});
+                                try stdout_writer.flush();
+                            },
+                        }
+                    };
                 },
                 PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT => {
                     try stdout_writer.print("Unrecognized keyword at the start {s}", .{trimmed});
