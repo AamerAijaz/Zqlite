@@ -414,14 +414,12 @@ pub const Table = struct {
     pub fn execute_statement(self: *Table, io: std.Io, allocator: std.mem.Allocator, statement: *Statement) !ExecuteResult {
         switch (statement.statement_type) {
             StatementType.STATEMENT_INSERT => {
-                const root_node = try self.pager.get_node(io, allocator, self.root_page_num);
-                const num_cells = root_node.get_num_cells();
-
                 const row = &statement.row_to_insert;
                 var cursor = try Cursor.find(self, io, allocator, row.id);
+                const node = try cursor.table.pager.get_node(io, allocator, cursor.page_num);
+                const num_cells = node.get_num_cells();
 
                 if (cursor.cell_num < num_cells) {
-                    const node = try cursor.table.pager.get_node(io, allocator, cursor.page_num);
                     const cell_key = node.get_cell_key_value(cursor.cell_num);
                     if (cell_key == row.id) {
                         return ExecuteError.DuplicateKey;
@@ -473,8 +471,7 @@ pub const Cursor = struct {
     cell_num: u32,
     end_of_table: bool,
 
-    /// Returns a cursor at the start of the table.
-    pub fn start(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
+    pub fn root(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
         const root_node = try table.pager.get_node(io, allocator, table.root_page_num);
 
         return Cursor{
@@ -483,6 +480,14 @@ pub const Cursor = struct {
             .cell_num = 0,
             .end_of_table = root_node.get_num_cells() == 0,
         };
+    }
+
+    /// Returns a cursor at the start of the table.
+    pub fn start(table: *Table, io: std.Io, allocator: std.mem.Allocator) !Cursor {
+        var cursor = try Cursor.find(table, io, allocator, 0);
+        const node = try cursor.table.pager.get_node(io, allocator, cursor.page_num);
+        cursor.end_of_table = (node.get_num_cells() == 0);
+        return cursor;
     }
 
     /// Returns a cursor at the end of the table.
@@ -497,15 +502,16 @@ pub const Cursor = struct {
         };
     }
 
+    /// Finds the cell and page closest to the given key.
+    /// The page value pointed to by the cursor will be a leaf node.
     pub fn find(table: *Table, io: std.Io, allocator: std.mem.Allocator, key: u32) !Cursor {
-        var cursor = try Cursor.start(table, io, allocator);
+        var cursor = try Cursor.root(table, io, allocator);
         var root_node = try cursor.table.pager.get_node(io, allocator, table.root_page_num);
 
         if (root_node.get_node_type() == NodeType.Leaf) {
             try cursor.find_in_leaf_node(root_node, key);
         } else {
-            std.debug.print("Searching in internal nodes is not implemented yet!", .{});
-            return CursorError.UnimplementedNodeSplitting;
+            try cursor.find_in_internal_node(io, allocator, root_node, key);
         }
 
         return cursor;
@@ -530,6 +536,31 @@ pub const Cursor = struct {
         }
 
         self.cell_num = min_index;
+    }
+
+    pub fn find_in_internal_node(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, node: Node, key: u32) !void {
+        const num_keys = try node.get_num_keys();
+        var min_index: u32 = 0;
+        var max_index: u32 = num_keys;
+        while (min_index != max_index) {
+            const index = (min_index + max_index) / 2;
+            const key_at_index = node.get_cell_key_value(index);
+            if (key_at_index >= key) {
+                max_index = index;
+            } else {
+                min_index = index + 1;
+            }
+        }
+
+        const index = min_index;
+        const child_page = try node.get_child_pointer(index);
+        const child_node = try self.table.pager.get_node(io, allocator, child_page);
+
+        self.page_num = child_page;
+        switch (child_node.get_node_type()) {
+            NodeType.Internal => try self.find_in_internal_node(io, allocator, child_node, key),
+            NodeType.Leaf => try self.find_in_leaf_node(child_node, key),
+        }
     }
 
     /// Returns the current cell in bytes present at the current cursor position.
