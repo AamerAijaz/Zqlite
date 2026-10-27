@@ -620,12 +620,14 @@ pub const Cursor = struct {
             try new_node.initialize_leaf_node();
 
             // Split the cells between the new node and the original node.
-            for (0..LEAF_NODE_MAX_CELLS + 1) |index| {
+            var index: u32 = LEAF_NODE_MAX_CELLS;
+            while (index >= 0) {
                 var destination_node = if (index >= LEAF_NODE_LEFT_SPLIT_COUNT) new_node else source_node;
                 const destination_cell_num: u32 = @intCast(index % LEAF_NODE_LEFT_SPLIT_COUNT);
 
                 if (index == self.cell_num) {
                     serialize_row(row, try destination_node.get_cell_value(destination_cell_num));
+                    destination_node.set_cell_key(destination_cell_num, key);
                 } else if (index > self.cell_num) {
                     const source_cell_num: u32 = @intCast(index - 1);
                     @memmove(destination_node.get_cell(destination_cell_num), source_node.get_cell(source_cell_num));
@@ -633,6 +635,9 @@ pub const Cursor = struct {
                     const source_cell_num: u32 = @intCast(index);
                     @memmove(destination_node.get_cell(destination_cell_num), source_node.get_cell(source_cell_num));
                 }
+
+                if (index == 0) break;
+                index -= 1;
             }
 
             try source_node.set_next_leaf_node(next_page);
@@ -701,6 +706,8 @@ pub fn print_tree_indent(io: std.Io, allocator: std.mem.Allocator, table: *Table
             std.debug.print("- internal (size {d})\n", .{num_keys});
 
             for (0..num_keys) |key| {
+                const key_x = node.get_cell_key_value(@intCast(key));
+                std.debug.print("key - {d}\n", .{key_x});
                 const child_page = try node.get_child_pointer(@intCast(key));
                 const child_node = try table.pager.get_node(io, allocator, child_page);
                 try print_tree_indent(io, allocator, table, &child_node, indent + 1);
@@ -717,8 +724,9 @@ pub fn print_tree_indent(io: std.Io, allocator: std.mem.Allocator, table: *Table
 
             for (0..num_cells) |cell_num| {
                 const cell = try node.get_cell_value(@intCast(cell_num));
+                const key = node.get_cell_key_value(@intCast(cell_num));
                 const row = try deserialize_row(cell);
-                std.debug.print(" - {d} {s}\n", .{ row.id, row.username });
+                std.debug.print(" - {d} {s}, key - {d}\n", .{ row.id, row.username, key });
             }
         },
     }
