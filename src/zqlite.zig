@@ -19,20 +19,41 @@ const LEAF_NODE_NUM_CELLS_SIZE = @sizeOf(u32);
 const LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
 const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
 
-// Lead Node Body Layout.
+// Leaf Node Body Layout.
 const LEAF_NODE_KEY_SIZE = @sizeOf(u32);
 const LEAF_NODE_KEY_OFFSET = 0;
 const LEAF_NODE_VALUE_SIZE = ROW_SIZE;
 const LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
 const LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 const LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
-const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND };
+// Leaf Node Constants.
+const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+const LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
+const LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
+
+// Internal Node Header Layout.
+const INTERNAL_NODE_NUM_KEYS_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const INTERNAL_NODE_RIGHT_CHILD_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_RIGHT_CHILD_OFFSET = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE;
+const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE + INTERNAL_NODE_RIGHT_CHILD_SIZE;
+
+// Internal Node Body Layout
+const INTERNAL_NODE_KEY_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_CHILD_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
+
+const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND, META_COMMAND_SUCCESS };
 const PrepareResult = enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_INVALID_INSERT };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
 const ExecuteResult = enum { EXECUTE_SUCCESS };
-const NodeType = enum(u8) { NODE_LEAF, NODE_INTERNAL };
+const NodeType = enum(u8) { Leaf, Internal };
+
+pub const NodeError = error{
+    InvalidNodeType,
+    InvalidPageNum,
+};
 
 pub const ExecuteError = error{
     TableFull,
@@ -128,8 +149,15 @@ pub const Node = struct {
 
     /// Initializes a node as a leaf_node.
     pub fn initialize_leaf_node(self: *Node) void {
+        self.set_node_type(NodeType.Leaf);
+        self.set_node_root(false);
         self.set_num_cells(0);
-        self.set_node_type(NodeType.NODE_LEAF);
+    }
+
+    pub fn initialize_internal_node(self: *Node) !void {
+        self.set_node_type(NodeType.Internal);
+        self.set_node_root(false);
+        try self.set_num_keys(0);
     }
 
     pub fn get_node_type(self: *const Node) NodeType {
@@ -149,29 +177,84 @@ pub const Node = struct {
         return !std.mem.allEqual(u8, self.buffer[IS_ROOT_OFFSET .. IS_ROOT_OFFSET + IS_ROOT_SIZE], 0);
     }
 
+    pub fn set_node_root(self: *Node, root: bool) void {
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        const destination = self.buffer[IS_ROOT_OFFSET .. IS_ROOT_OFFSET + IS_ROOT_SIZE];
+        @memcpy(destination, &std.mem.toBytes(root));
+    }
+
+    pub fn get_num_keys(self: *const Node) !u32 {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: get_num_keys requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= INTERNAL_NODE_HEADER_SIZE);
+        const destination = self.buffer[INTERNAL_NODE_NUM_KEYS_OFFSET .. INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE];
+        return std.mem.readInt(u32, destination[0..4], .little);
+    }
+
+    pub fn set_num_keys(self: *Node, num_keys: u32) !void {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: set_num_keys requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= INTERNAL_NODE_HEADER_SIZE);
+        const destination = self.buffer[INTERNAL_NODE_NUM_KEYS_OFFSET .. INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE];
+        @memcpy(destination, &std.mem.toBytes(num_keys));
+    }
+
+    pub fn get_right_child(self: *const Node) !u32 {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: get_right_child requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= INTERNAL_NODE_HEADER_SIZE);
+        const destination = self.buffer[INTERNAL_NODE_RIGHT_CHILD_OFFSET .. INTERNAL_NODE_RIGHT_CHILD_OFFSET + INTERNAL_NODE_RIGHT_CHILD_SIZE];
+        return std.mem.readInt(u32, destination[0..4], .little);
+    }
+
+    pub fn set_right_child(self: *Node, right_child: u32) !void {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: set_right_child requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= INTERNAL_NODE_HEADER_SIZE);
+        const destination = self.buffer[INTERNAL_NODE_RIGHT_CHILD_OFFSET .. INTERNAL_NODE_RIGHT_CHILD_OFFSET + INTERNAL_NODE_RIGHT_CHILD_SIZE];
+        @memcpy(destination, &std.mem.toBytes(right_child));
+    }
+
     pub fn get_num_cells(self: *const Node) u32 {
         std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
-        return @bitCast(self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE].*);
+        const destination = self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE];
+        return std.mem.readInt(u32, destination[0..4], .little);
     }
 
     pub fn set_num_cells(self: *Node, num_cells: u32) void {
         std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE);
         const destination = self.buffer[LEAF_NODE_NUM_CELLS_OFFSET .. LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE];
-        @memcpy(destination, std.mem.asBytes(&num_cells));
+        @memcpy(destination, &std.mem.toBytes(num_cells));
     }
 
     pub fn get_cell(self: *const Node, cell_num: u32) []u8 {
-        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+        const is_internal = self.get_node_type() == NodeType.Internal;
+        const header_size: u32 = if (is_internal) INTERNAL_NODE_HEADER_SIZE else LEAF_NODE_HEADER_SIZE;
+        const cell_size: u32 = if (is_internal) INTERNAL_NODE_CELL_SIZE else LEAF_NODE_CELL_SIZE;
 
-        const start_position = LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
-        const end_position = LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE;
-        return self.buffer[start_position .. end_position + 1];
+        std.debug.assert(self.buffer.len >= header_size + (cell_num + 1) * cell_size);
+
+        const start_position = header_size + cell_num * cell_size;
+        const end_position = header_size + (cell_num + 1) * cell_size;
+        return self.buffer[start_position..end_position];
     }
 
     pub fn get_cell_key(self: *const Node, cell_num: u32) []u8 {
-        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+        const is_internal = self.get_node_type() == NodeType.Internal;
+        const key_size: u32 = if (is_internal) INTERNAL_NODE_KEY_SIZE else LEAF_NODE_KEY_SIZE;
+        const start_position: u32 = if (is_internal) INTERNAL_NODE_CHILD_SIZE else 0;
+        const end_position = start_position + key_size;
+
         const cell = self.get_cell(cell_num);
-        return cell[0..LEAF_NODE_KEY_SIZE];
+        return cell[start_position..end_position];
     }
 
     pub fn get_cell_key_value(self: *const Node, cell_num: u32) u32 {
@@ -180,18 +263,54 @@ pub const Node = struct {
     }
 
     pub fn set_cell_key(self: *Node, cell_num: u32, key: u32) void {
-        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
         const cell_key = self.get_cell_key(cell_num);
-        @memcpy(cell_key, std.mem.asBytes(&key));
+        @memcpy(cell_key, &std.mem.toBytes(key));
     }
 
-    pub fn get_cell_value(self: *const Node, cell_num: u32) []u8 {
-        std.debug.assert(self.buffer.len >= LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE);
+    pub fn get_cell_value(self: *const Node, cell_num: u32) ![]u8 {
+        if (self.get_node_type() != NodeType.Leaf) {
+            std.debug.print("Invalid Node Type: get_cell_value requires leaf node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        const cell = self.get_cell(cell_num);
+        return cell[LEAF_NODE_VALUE_OFFSET .. LEAF_NODE_VALUE_OFFSET + LEAF_NODE_VALUE_SIZE];
+    }
+
+    pub fn get_child_pointer(self: *const Node, cell_num: u32) !u32 {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: get_child_pointer requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        const num_keys = try self.get_num_keys();
+        if (cell_num == num_keys) {
+            return try self.get_right_child();
+        }
 
         const cell = self.get_cell(cell_num);
-        std.debug.assert(cell.len >= LEAF_NODE_VALUE_OFFSET + LEAF_NODE_VALUE_SIZE);
+        const buffer = cell[0..INTERNAL_NODE_CHILD_SIZE];
+        return std.mem.readInt(u32, buffer[0..4], .little);
+    }
 
-        return cell[LEAF_NODE_VALUE_OFFSET .. LEAF_NODE_VALUE_OFFSET + LEAF_NODE_VALUE_SIZE];
+    pub fn set_child_pointer(self: *Node, cell_num: u32, child_page_num: u32) !void {
+        if (self.get_node_type() != NodeType.Internal) {
+            std.debug.print("Invalid Node Type: set_child_pointer requires internal node:\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+        const cell = self.get_cell(cell_num);
+        const buffer = cell[0..INTERNAL_NODE_CHILD_SIZE];
+        @memcpy(buffer, &std.mem.toBytes(child_page_num));
+    }
+
+    pub fn get_max_key(self: *const Node) ![]u8 {
+        return switch (self.get_node_type()) {
+            NodeType.Leaf => self.get_cell_key(self.get_num_cells() - 1),
+            NodeType.Internal => self.get_cell_key(try self.get_num_keys() - 1),
+        };
+    }
+
+    pub fn get_max_key_value(self: *const Node) !u32 {
+        const max_key = try self.get_max_key();
+        return std.mem.readInt(u32, max_key[0..4], .little);
     }
 };
 
@@ -247,6 +366,10 @@ pub const Pager = struct {
             const offset = page_num * PAGE_SIZE;
             _ = try self.database_file.readPositional(io, &.{p}, offset);
 
+            if (page_num >= self.num_pages) {
+                self.num_pages += 1;
+            }
+
             self.pages[page_num] = p;
             return p;
         };
@@ -257,6 +380,10 @@ pub const Pager = struct {
     pub fn get_node(self: *Pager, io: std.Io, allocator: std.mem.Allocator, page_num: u32) !Node {
         const page = try self.get_page(io, allocator, page_num);
         return Node.init(page);
+    }
+
+    pub fn get_unused_page_num(self: *Pager) u32 {
+        return self.num_pages;
     }
 };
 
@@ -271,6 +398,7 @@ pub const Table = struct {
         if (pager.num_pages == 0) {
             var root_node = try pager.get_node(io, allocator, 0);
             root_node.initialize_leaf_node();
+            root_node.set_node_root(true);
         }
 
         return Table{
@@ -288,9 +416,6 @@ pub const Table = struct {
             StatementType.STATEMENT_INSERT => {
                 const root_node = try self.pager.get_node(io, allocator, self.root_page_num);
                 const num_cells = root_node.get_num_cells();
-                if (num_cells >= LEAF_NODE_MAX_CELLS) {
-                    return ExecuteError.TableFull;
-                }
 
                 const row = &statement.row_to_insert;
                 var cursor = try Cursor.find(self, io, allocator, row.id);
@@ -317,6 +442,28 @@ pub const Table = struct {
 
         std.debug.print("Executed", .{});
         return ExecuteResult.EXECUTE_SUCCESS;
+    }
+
+    pub fn create_new_root(self: *Table, io: std.Io, allocator: std.mem.Allocator, right_child_page_num: u32) !void {
+        const root = try self.pager.get_page(io, allocator, self.root_page_num);
+        var root_node = Node.init(root);
+
+        const left_child_page_num = self.pager.get_unused_page_num();
+        const left_child = try self.pager.get_page(
+            io,
+            allocator,
+            left_child_page_num,
+        );
+        var left_child_node = Node.init(left_child);
+
+        @memmove(left_child, root);
+        left_child_node.set_node_root(false);
+        try root_node.initialize_internal_node();
+        root_node.set_node_root(true);
+        try root_node.set_num_keys(1);
+        try root_node.set_child_pointer(0, left_child_page_num);
+        root_node.set_cell_key(0, try left_child_node.get_max_key_value());
+        try root_node.set_right_child(right_child_page_num);
     }
 };
 
@@ -354,7 +501,7 @@ pub const Cursor = struct {
         var cursor = try Cursor.start(table, io, allocator);
         var root_node = try cursor.table.pager.get_node(io, allocator, table.root_page_num);
 
-        if (root_node.get_node_type() == NodeType.NODE_LEAF) {
+        if (root_node.get_node_type() == NodeType.Leaf) {
             try cursor.find_in_leaf_node(root_node, key);
         } else {
             std.debug.print("Searching in internal nodes is not implemented yet!", .{});
@@ -388,7 +535,7 @@ pub const Cursor = struct {
     /// Returns the current cell in bytes present at the current cursor position.
     pub fn value(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) ![]u8 {
         const node = try self.table.pager.get_node(io, allocator, self.page_num);
-        return node.get_cell_value(self.cell_num);
+        return try node.get_cell_value(self.cell_num);
     }
 
     /// advances the cursor to the next cell in the page.
@@ -404,8 +551,41 @@ pub const Cursor = struct {
         const num_cells = node.get_num_cells();
 
         if (num_cells >= LEAF_NODE_MAX_CELLS) {
-            std.debug.print("Need to implement splitting a full node", .{});
-            return CursorError.UnimplementedNodeSplitting;
+            // If the number of cells exceed the max number of cells in a leaf-node.
+            // We split the cells into two new nodes (left and right).
+            var source_node = node;
+
+            // We first create a new leaf-node. This new leaf node will lead to a new page being allocated.
+            const next_page = self.table.pager.get_unused_page_num();
+            var new_node = try self.table.pager.get_node(io, allocator, next_page);
+            new_node.initialize_leaf_node();
+
+            // Split the cells between the new node and the original node.
+            for (0..LEAF_NODE_MAX_CELLS + 1) |index| {
+                var destination_node = if (index >= LEAF_NODE_LEFT_SPLIT_COUNT) new_node else source_node;
+                const destination_cell_num: u32 = @intCast(index % LEAF_NODE_LEFT_SPLIT_COUNT);
+
+                if (index == self.cell_num) {
+                    serialize_row(row, try destination_node.get_cell_value(destination_cell_num));
+                } else if (index > self.cell_num) {
+                    const source_cell_num: u32 = @intCast(index - 1);
+                    @memmove(destination_node.get_cell(destination_cell_num), source_node.get_cell(source_cell_num));
+                } else {
+                    const source_cell_num: u32 = @intCast(index);
+                    @memmove(destination_node.get_cell(destination_cell_num), source_node.get_cell(source_cell_num));
+                }
+            }
+
+            source_node.set_num_cells(LEAF_NODE_LEFT_SPLIT_COUNT);
+            new_node.set_num_cells(LEAF_NODE_RIGHT_SPLIT_COUNT);
+
+            if (source_node.is_root()) {
+                try self.table.create_new_root(io, allocator, next_page);
+                return;
+            } else {
+                std.debug.print("Unimplemented: Updating parent after split.", .{});
+                return CursorError.UnimplementedNodeSplitting;
+            }
         }
 
         if (self.cell_num < num_cells) {
@@ -417,7 +597,7 @@ pub const Cursor = struct {
 
         node.set_num_cells(num_cells + 1);
         node.set_cell_key(self.cell_num, key);
-        serialize_row(row, node.get_cell_value(self.cell_num));
+        serialize_row(row, try node.get_cell_value(self.cell_num));
     }
 };
 
@@ -430,9 +610,12 @@ pub fn deserialize_row(source: []u8) !Row {
     return row;
 }
 
-pub fn do_meta_command(line: []const u8) MetaCommandResult {
+pub fn do_meta_command(line: []const u8, io: std.Io, allocator: std.mem.Allocator, table: *Table) !MetaCommandResult {
     if (std.mem.eql(u8, line, ".exit")) {
         return MetaCommandResult.META_COMMAND_EXIT;
+    } else if (std.mem.eql(u8, line, ".btree")) {
+        try print_tree(io, allocator, table);
+        return MetaCommandResult.META_COMMAND_SUCCESS;
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
     }
@@ -440,6 +623,45 @@ pub fn do_meta_command(line: []const u8) MetaCommandResult {
 
 pub fn open_database(io: std.Io, path: []const u8) !Table {
     return try .init(io, path);
+}
+
+pub fn print_tree(io: std.Io, allocator: std.mem.Allocator, table: *Table) !void {
+    const root = try table.pager.get_node(io, allocator, table.root_page_num);
+    try print_tree_indent(io, allocator, table, &root, 0);
+}
+
+pub fn print_tree_indent(io: std.Io, allocator: std.mem.Allocator, table: *Table, node: *const Node, indent: u32) !void {
+    for (0..indent + 1) |_| {
+        std.debug.print(" ", .{});
+    }
+
+    switch (node.get_node_type()) {
+        NodeType.Internal => {
+            const num_keys = try node.get_num_keys();
+            std.debug.print("- internal (size {d})\n", .{num_keys});
+
+            for (0..num_keys) |key| {
+                const child_page = try node.get_child_pointer(@intCast(key));
+                const child_node = try table.pager.get_node(io, allocator, child_page);
+                try print_tree_indent(io, allocator, table, &child_node, indent + 1);
+            }
+
+            const right_child_page = try node.get_right_child();
+            const right_child_node = try table.pager.get_node(io, allocator, right_child_page);
+            try print_tree_indent(io, allocator, table, &right_child_node, indent + 1);
+            std.debug.print("\n", .{});
+        },
+        NodeType.Leaf => {
+            const num_cells = node.get_num_cells();
+            std.debug.print("- leaf (size {d})\n", .{num_cells});
+
+            for (0..num_cells) |cell_num| {
+                const cell = try node.get_cell_value(@intCast(cell_num));
+                const row = try deserialize_row(cell);
+                std.debug.print(" - {d} {s}\n", .{ row.id, row.username });
+            }
+        },
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -486,7 +708,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (trimmed[0] == '.') {
-            switch (do_meta_command(trimmed)) {
+            switch (try do_meta_command(trimmed, io, allocator, &table)) {
                 MetaCommandResult.META_COMMAND_EXIT => {
                     return;
                 },
@@ -494,6 +716,7 @@ pub fn main(init: std.process.Init) !void {
                     try stdout_writer.print("Unrecognized Command {s}", .{trimmed});
                     try stdout_writer.flush();
                 },
+                MetaCommandResult.META_COMMAND_SUCCESS => {},
             }
         } else {
             var statement: Statement = .{ .statement_type = undefined, .row_to_insert = undefined };
