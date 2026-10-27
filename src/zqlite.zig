@@ -17,7 +17,9 @@ const COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_S
 // Leaf Node Header Layout.
 const LEAF_NODE_NUM_CELLS_SIZE = @sizeOf(u32);
 const LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+const LEAF_NODE_NEXT_LEAF_SIZE = @sizeOf(u32);
+const LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE;
 
 // Leaf Node Body Layout.
 const LEAF_NODE_KEY_SIZE = @sizeOf(u32);
@@ -148,9 +150,10 @@ pub const Node = struct {
     }
 
     /// Initializes a node as a leaf_node.
-    pub fn initialize_leaf_node(self: *Node) void {
+    pub fn initialize_leaf_node(self: *Node) !void {
         self.set_node_type(NodeType.Leaf);
         self.set_node_root(false);
+        try self.set_next_leaf_node(0);
         self.set_num_cells(0);
     }
 
@@ -158,6 +161,24 @@ pub const Node = struct {
         self.set_node_type(NodeType.Internal);
         self.set_node_root(false);
         try self.set_num_keys(0);
+    }
+
+    pub fn get_next_leaf_node(self: *const Node) !u32 {
+        if (self.get_node_type() != NodeType.Leaf) {
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        const destination = self.buffer[LEAF_NODE_NEXT_LEAF_OFFSET .. LEAF_NODE_NEXT_LEAF_OFFSET + LEAF_NODE_NEXT_LEAF_SIZE];
+        return std.mem.readInt(u32, destination[0..4], .little);
+    }
+
+    pub fn set_next_leaf_node(self: *const Node, next_node_page: u32) !void {
+        if (self.get_node_type() != NodeType.Leaf) {
+            return NodeError.InvalidNodeType;
+        }
+        std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
+        const destination = self.buffer[LEAF_NODE_NEXT_LEAF_OFFSET .. LEAF_NODE_NEXT_LEAF_OFFSET + LEAF_NODE_NEXT_LEAF_SIZE];
+        @memmove(destination, &std.mem.toBytes(next_node_page));
     }
 
     pub fn get_node_type(self: *const Node) NodeType {
@@ -397,7 +418,7 @@ pub const Table = struct {
         // Initialize the root_node if it is a new table.
         if (pager.num_pages == 0) {
             var root_node = try pager.get_node(io, allocator, 0);
-            root_node.initialize_leaf_node();
+            try root_node.initialize_leaf_node();
             root_node.set_node_root(true);
         }
 
@@ -456,6 +477,7 @@ pub const Table = struct {
 
         @memmove(left_child, root);
         left_child_node.set_node_root(false);
+        try left_child_node.set_next_leaf_node(right_child_page_num);
         try root_node.initialize_internal_node();
         root_node.set_node_root(true);
         try root_node.set_num_keys(1);
@@ -572,9 +594,15 @@ pub const Cursor = struct {
     /// advances the cursor to the next cell in the page.
     pub fn advance(self: *Cursor, io: std.Io, allocator: std.mem.Allocator) !void {
         const node = try self.table.pager.get_node(io, allocator, self.page_num);
+        const next_node_page = try node.get_next_leaf_node();
 
-        self.cell_num += 1;
-        self.end_of_table = self.cell_num >= node.get_num_cells();
+        if (self.cell_num + 1 >= node.get_num_cells() and next_node_page != 0) {
+            self.page_num = next_node_page;
+            self.cell_num = 0;
+        } else {
+            self.cell_num += 1;
+            self.end_of_table = self.cell_num >= node.get_num_cells();
+        }
     }
 
     pub fn insert_row(self: *Cursor, io: std.Io, allocator: std.mem.Allocator, key: u32, row: *const Row) !void {
@@ -589,7 +617,7 @@ pub const Cursor = struct {
             // We first create a new leaf-node. This new leaf node will lead to a new page being allocated.
             const next_page = self.table.pager.get_unused_page_num();
             var new_node = try self.table.pager.get_node(io, allocator, next_page);
-            new_node.initialize_leaf_node();
+            try new_node.initialize_leaf_node();
 
             // Split the cells between the new node and the original node.
             for (0..LEAF_NODE_MAX_CELLS + 1) |index| {
@@ -607,6 +635,7 @@ pub const Cursor = struct {
                 }
             }
 
+            try source_node.set_next_leaf_node(next_page);
             source_node.set_num_cells(LEAF_NODE_LEFT_SPLIT_COUNT);
             new_node.set_num_cells(LEAF_NODE_RIGHT_SPLIT_COUNT);
 
