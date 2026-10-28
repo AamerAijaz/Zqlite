@@ -49,6 +49,8 @@ const INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZ
 // Internal Node Constants.
 const INTERNAL_NODE_MAX_CELLS = 3;
 
+const InvalidPageNum = std.math.maxInt(u32);
+
 const MetaCommandResult = enum { META_COMMAND_EXIT, META_COMMAND_UNRECOGNIZED_COMMAND, META_COMMAND_SUCCESS };
 const PrepareResult = enum { PREPARE_SUCCESS, PREPARE_UNRECOGNIZED_STATEMENT, PREPARE_INVALID_INSERT };
 const StatementType = enum { STATEMENT_INSERT, STATEMENT_SELECT };
@@ -163,6 +165,7 @@ pub const Node = struct {
     pub fn initialize_internal_node(self: *Node) !void {
         self.set_node_type(NodeType.Internal);
         self.set_node_root(false);
+        try self.set_right_child(InvalidPageNum);
         try self.set_num_keys(0);
     }
 
@@ -180,6 +183,7 @@ pub const Node = struct {
 
     pub fn get_next_leaf_node(self: *const Node) !u32 {
         if (self.get_node_type() != NodeType.Leaf) {
+            std.debug.print("get_next_leaf_node requires leaf_node\n", .{});
             return NodeError.InvalidNodeType;
         }
         std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
@@ -189,6 +193,7 @@ pub const Node = struct {
 
     pub fn set_next_leaf_node(self: *const Node, next_node_page: u32) !void {
         if (self.get_node_type() != NodeType.Leaf) {
+            std.debug.print("set_next_leaf_node requires leaf_node\n", .{});
             return NodeError.InvalidNodeType;
         }
         std.debug.assert(self.buffer.len >= COMMON_NODE_HEADER_SIZE);
@@ -319,12 +324,22 @@ pub const Node = struct {
         }
         const num_keys = try self.get_num_keys();
         if (cell_num == num_keys) {
-            return try self.get_right_child();
+            const right_child_page = try self.get_right_child();
+            if (right_child_page == InvalidPageNum) {
+                std.debug.print("Trying to access Invalid page num: \n", .{});
+                return NodeError.InvalidPageNum;
+            }
+            return right_child_page;
         }
 
         const cell = self.get_cell(cell_num);
         const buffer = cell[0..INTERNAL_NODE_CHILD_SIZE];
-        return std.mem.readInt(u32, buffer[0..4], .little);
+        const child_page = std.mem.readInt(u32, buffer[0..4], .little);
+        if (child_page == InvalidPageNum) {
+            std.debug.print("Trying to access Invalid page num: \n", .{});
+            return NodeError.InvalidPageNum;
+        }
+        return child_page;
     }
 
     pub fn set_child_pointer(self: *Node, cell_num: u32, child_page_num: u32) !void {
@@ -344,9 +359,13 @@ pub const Node = struct {
         };
     }
 
-    pub fn get_max_key_value(self: *const Node) !u32 {
-        const max_key = try self.get_max_key();
-        return std.mem.readInt(u32, max_key[0..4], .little);
+    pub fn get_max_key_value(self: *const Node, pager: *Pager, io: std.Io, allocator: std.mem.Allocator) !u32 {
+        if (self.get_node_type() == NodeType.Leaf) {
+            const max_key = try self.get_max_key();
+            return std.mem.readInt(u32, max_key[0..4], .little);
+        }
+        const right_node = try pager.get_node(io, allocator, try self.get_right_child());
+        return try right_node.get_max_key_value(pager, io, allocator);
     }
 };
 
@@ -489,18 +508,34 @@ pub const Table = struct {
             left_child_page_num,
         );
         var left_child_node = Node.init(left_child);
-
         var right_child_node = try self.pager.get_node(io, allocator, right_child_page_num);
+
+        if (root_node.get_node_type() == NodeType.Internal) {
+            try left_child_node.initialize_internal_node();
+            try right_child_node.initialize_internal_node();
+        }
 
         @memmove(left_child, root);
         left_child_node.set_node_root(false);
-        try left_child_node.set_next_leaf_node(right_child_page_num);
+        if (left_child_node.get_node_type() == NodeType.Leaf) {
+            try left_child_node.set_next_leaf_node(right_child_page_num);
+        }
+
+        if (left_child_node.get_node_type() == NodeType.Internal) {
+            var child: Node = undefined;
+            for (0..try left_child_node.get_num_keys()) |index| {
+                child = try self.pager.get_node(io, allocator, @intCast(index));
+                child.set_parent(left_child_page_num);
+            }
+            child = try self.pager.get_node(io, allocator, try left_child_node.get_right_child());
+            child.set_parent(left_child_page_num);
+        }
 
         try root_node.initialize_internal_node();
         root_node.set_node_root(true);
         try root_node.set_num_keys(1);
         try root_node.set_child_pointer(0, left_child_page_num);
-        root_node.set_cell_key(0, try left_child_node.get_max_key_value());
+        root_node.set_cell_key(0, try left_child_node.get_max_key_value(&self.pager, io, allocator));
         try root_node.set_right_child(right_child_page_num);
 
         left_child_node.set_parent(self.root_page_num);
@@ -647,7 +682,7 @@ pub const Cursor = struct {
             try new_node.initialize_leaf_node();
             new_node.set_parent(parent_page_num);
 
-            const old_max = try source_node.get_max_key_value();
+            const old_max = try source_node.get_max_key_value(&self.table.pager, io, allocator);
             std.debug.print("Max key value - old {d}\n", .{old_max});
 
             // Split the cells between the new node and the original node.
@@ -675,7 +710,7 @@ pub const Cursor = struct {
             source_node.set_num_cells(LEAF_NODE_LEFT_SPLIT_COUNT);
             new_node.set_num_cells(LEAF_NODE_RIGHT_SPLIT_COUNT);
 
-            const new_max = try source_node.get_max_key_value();
+            const new_max = try source_node.get_max_key_value(&self.table.pager, io, allocator);
             std.debug.print("Max key value - new {d}\n", .{new_max});
 
             if (source_node.is_root()) {
@@ -683,11 +718,7 @@ pub const Cursor = struct {
                 return;
             } else {
                 var parent_node = try self.table.pager.get_node(io, allocator, parent_page_num);
-
-                // Update the first cell in the parent node to point to a new max value instead.
-                const cell_num = try self.find_internal_node_child(parent_node, old_max);
-                parent_node.set_cell_key(cell_num, new_max);
-                try parent_node.set_child_pointer(cell_num, self.page_num);
+                try self.update_key(&parent_node, old_max, new_max);
 
                 try self.insert_internal_node(io, allocator, parent_page_num, next_page);
                 return;
@@ -710,19 +741,78 @@ pub const Cursor = struct {
         var parent_node = try self.table.pager.get_node(io, allocator, parent_page_num);
         var child_node = try self.table.pager.get_node(io, allocator, child_page_num);
 
-        const child_max_key = try child_node.get_max_key_value();
+        const child_max_key = try child_node.get_max_key_value(&self.table.pager, io, allocator);
         const index = try self.find_internal_node_child(parent_node, child_max_key);
 
         const original_num_keys = try parent_node.get_num_keys();
         if (original_num_keys >= INTERNAL_NODE_MAX_CELLS) {
-            std.debug.print("Unimplemented - Internal Node Splitting\n", .{});
-            return CursorError.UnimplementedNodeSplitting;
+            var old_page_num = parent_page_num;
+
+            var old_node = try self.table.pager.get_node(io, allocator, old_page_num);
+            const old_max = try old_node.get_max_key_value(&self.table.pager, io, allocator);
+
+            var child = try self.table.pager.get_node(io, allocator, child_page_num);
+            const child_max = try child.get_max_key_value(&self.table.pager, io, allocator);
+
+            const new_page_num = self.table.pager.get_unused_page_num();
+            var parent: Node = undefined;
+            var new_node: Node = undefined;
+            const splitting_root = old_node.is_root();
+            if (splitting_root) {
+                try self.table.create_new_root(io, allocator, new_page_num);
+                parent = try self.table.pager.get_node(io, allocator, self.table.root_page_num);
+                old_page_num = try parent.get_child_pointer(0);
+                old_node = try self.table.pager.get_node(io, allocator, old_page_num);
+            } else {
+                parent = try self.table.pager.get_node(io, allocator, old_node.get_parent());
+                new_node = try self.table.pager.get_node(io, allocator, new_page_num);
+            }
+
+            var old_num_keys = try old_node.get_num_keys();
+            var cur_page_num = try old_node.get_right_child();
+            var cur = try self.table.pager.get_node(io, allocator, cur_page_num);
+
+            try self.insert_internal_node(io, allocator, new_page_num, cur_page_num);
+            cur.set_parent(new_page_num);
+            try old_node.set_right_child(@intCast(InvalidPageNum));
+
+            var i: u32 = INTERNAL_NODE_MAX_CELLS - 1;
+            const split_point: u32 = INTERNAL_NODE_MAX_CELLS / 2;
+            while (i > split_point) : (i -= 1) {
+                cur_page_num = try old_node.get_child_pointer(i);
+                cur = try self.table.pager.get_node(io, allocator, cur_page_num);
+                try self.insert_internal_node(io, allocator, new_page_num, cur_page_num);
+                cur.set_parent(new_page_num);
+                old_num_keys -= 1;
+            }
+
+            try old_node.set_right_child(try old_node.get_child_pointer(old_num_keys - 1));
+            old_num_keys -= 1;
+
+            const max_after_split = try old_node.get_max_key_value(&self.table.pager, io, allocator);
+            const destination_page_num = if (child_max < max_after_split) old_page_num else new_page_num;
+            try self.insert_internal_node(io, allocator, destination_page_num, child_page_num);
+            child.set_parent(destination_page_num);
+
+            try self.update_key(&parent, old_max, try old_node.get_max_key_value(&self.table.pager, io, allocator));
+
+            if (!splitting_root) {
+                try self.insert_internal_node(io, allocator, old_node.get_parent(), new_page_num);
+                new_node.set_parent(old_node.get_parent());
+            }
+
+            return;
         }
-        try parent_node.set_num_keys(original_num_keys + 1);
 
         const right_child_page_num = try parent_node.get_right_child();
+        if (right_child_page_num == InvalidPageNum) {
+            try parent_node.set_right_child(child_page_num);
+            return;
+        }
+
+        try parent_node.set_num_keys(original_num_keys + 1);
         const right_child_node = try self.table.pager.get_node(io, allocator, right_child_page_num);
-        const right_child_max_key = try right_child_node.get_max_key_value();
+        const right_child_max_key = try right_child_node.get_max_key_value(&self.table.pager, io, allocator);
 
         if (child_max_key > right_child_max_key) {
             try parent_node.set_right_child(child_page_num);
@@ -742,6 +832,17 @@ pub const Cursor = struct {
             try parent_node.set_child_pointer(index, child_page_num);
             parent_node.set_cell_key(index, child_max_key);
         }
+    }
+
+    pub fn update_key(self: *Cursor, node: *Node, old_max: u32, new_max: u32) !void {
+        if (node.get_node_type() != NodeType.Internal) {
+            std.debug.print("update_key requires internal node\n", .{});
+            return NodeError.InvalidNodeType;
+        }
+
+        const cell_num = try self.find_internal_node_child(node.*, old_max);
+        node.set_cell_key(cell_num, new_max);
+        try node.set_child_pointer(cell_num, self.page_num);
     }
 };
 
