@@ -1,7 +1,9 @@
 const std = @import("std");
 const cursor = @import("cursor.zig");
+const Statement = @import("statement.zig").Statement;
+const StatementType = @import("statement.zig").StatementType;
 
-pub const ConnectError = std.Io.File.OpenError || cursor.CursorError;
+pub const ConnectError = std.Io.File.OpenError;
 pub const MetaCommandResult = enum { Exit, Success, UnrecognizedCommand };
 
 pub const Connection = struct {
@@ -14,12 +16,19 @@ pub const Connection = struct {
         return MetaCommandResult.UnrecognizedCommand;
     }
 
+    pub fn execute_statement(self: *Connection, statement: Statement, writer: *std.Io.Writer) !void {
+        switch (statement.statement_type) {
+            StatementType.Insert => try self.cursor.insert(&statement.row_to_insert),
+            StatementType.Select => try self.cursor.select(writer),
+        }
+    }
+
     pub fn close(self: *Connection) void {
         self.cursor.deinit();
     }
 };
 
-pub fn connect(io: std.Io, allocator: std.mem.Allocator, db_path: []const u8) ConnectError!Connection {
+pub fn connect(io: std.Io, allocator: std.mem.Allocator, db_path: []const u8) !Connection {
     const cwd = std.Io.Dir.cwd();
     const file = cwd.openFile(io, db_path, .{ .mode = .read_write }) catch |err| {
         std.debug.print("Error: Unable to open database file, path: {s}\n", .{db_path});

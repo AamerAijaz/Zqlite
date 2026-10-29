@@ -897,33 +897,22 @@ pub fn main(init: std.process.Init) !void {
                 },
             }
         } else {
-            var stmt: Statement = undefined;
-            stmt.prepare_statement(trimmed) catch |err| switch (err) {
+            const stmt: Statement = statement.prepare_statement(trimmed) catch |err| switch (err) {
                 PrepareError.InvalidInsert => {
                     try stdout_writer.print("Error: Could not parse statement", .{});
                     try stdout_writer.flush();
+                    continue;
                 },
                 PrepareError.UnrecognizedStatement => {
                     try stdout_writer.print("Error: Unrecognized keyword at the start {s}", .{trimmed});
                     try stdout_writer.flush();
+                    continue;
                 },
             };
-            // _ = table.execute_statement(io, allocator, &statement) catch |err| {
-            //     switch (err) {
-            //         ExecuteError.TableFull => {
-            //             try stdout_writer.print("ERROR: Reached max table size", .{});
-            //             try stdout_writer.flush();
-            //         },
-            //         ExecuteError.DuplicateKey => {
-            //             try stdout_writer.print("ERROR: Cannot insert a duplicate key", .{});
-            //             try stdout_writer.flush();
-            //         },
-            //         else => {
-            //             try stdout_writer.print("ERROR: Unable to execute statement: {any}", .{err});
-            //             try stdout_writer.flush();
-            //         },
-            //     }
-            // };
+
+            try connection.execute_statement(stmt, stdout_writer);
+            try stdout_writer.print("Executed.", .{});
+            try stdout_writer.flush();
         }
 
         try stdout_writer.print("\n", .{});
