@@ -9,9 +9,12 @@ pub const MetaCommandResult = enum { Exit, Success, UnrecognizedCommand };
 pub const Connection = struct {
     cursor: cursor.Cursor,
 
-    pub fn execute_meta_command(_: *Connection, line: []const u8) MetaCommandResult {
+    pub fn execute_meta_command(self: *Connection, line: []const u8) MetaCommandResult {
         if (std.mem.eql(u8, line, ".exit")) {
             return MetaCommandResult.Exit;
+        } else if (std.mem.eql(u8, line, ".constants")) {
+            self.cursor.btree.print_leaf_constants();
+            return MetaCommandResult.Success;
         }
         return MetaCommandResult.UnrecognizedCommand;
     }

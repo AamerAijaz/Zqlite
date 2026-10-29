@@ -82,8 +82,8 @@ pub const LeafNode = struct {
     /// Leaf Node Constants.
     pub const CellSpace = pager.page_size - HeaderSize;
     pub const MaxCells = CellSpace / CellSize;
-    pub const RightSplitCount = (MaxCells + 1) / 2;
-    pub const LeafSplitCount = MaxCells + 1 - RightSplitCount;
+    pub const RightSplitCount = MaxCells / 2;
+    pub const LeftSplitCount = MaxCells - RightSplitCount;
 
     base: BaseNode,
 

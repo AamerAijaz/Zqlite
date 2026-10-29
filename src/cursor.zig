@@ -44,7 +44,7 @@ pub const Cursor = struct {
         self.cell = cell;
 
         const max_record = try self.btree.get_max_cell();
-        self.end_of_table = (page == max_record.page) and (cell == max_record.cell + 1);
+        self.end_of_table = self.btree.empty or (page == max_record.page) and (cell == max_record.cell + 1);
     }
 
     /// Advances the cursor's position.
@@ -77,6 +77,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !Cursor
         .btree = tree,
         .cell = 0,
         .page = 0,
-        .end_of_table = (max_record.page == 0) and (max_record.cell == 1),
+        .end_of_table = tree.empty or (max_record.page == 0) and (max_record.cell == 1),
     };
 }

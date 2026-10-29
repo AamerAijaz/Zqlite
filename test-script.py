@@ -10,6 +10,7 @@ def main():
 
     # **Capture the database name from the command line argument**
     database_name = sys.argv[1]
+    row = sys.argv[2]
     
     commands = [
         "insert 58 user58 person58@example.com",

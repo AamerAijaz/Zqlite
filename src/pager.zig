@@ -11,7 +11,7 @@ pub const PageGetError = std.Io.File.ReadPositionalError || error{
 pub const Pager = @This();
 
 // Static fields.
-pub const page_size = 4096;
+pub const page_size = 1024;
 pub const max_pages = 100;
 pub const Page = [page_size]u8;
 
