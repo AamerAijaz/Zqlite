@@ -94,3 +94,8 @@ pub fn flush(self: *Pager) void {
         }
     }
 }
+
+/// TODO: return unused pages from middle as well later on.
+pub fn get_unusued_page(self: *const Pager) u32 {
+    return self.num_pages;
+}

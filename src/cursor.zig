@@ -15,7 +15,7 @@ pub const Cursor = struct {
     }
 
     pub fn select(self: *Cursor, _: *std.Io.Writer) !void {
-        const start_record = self.btree.find(0);
+        const start_record = try self.btree.find(self.btree.root, 0);
         try self.set_position(start_record.page, start_record.cell);
 
         while (self.end_of_table != true) {
@@ -43,7 +43,7 @@ pub const Cursor = struct {
         self.page = page;
         self.cell = cell;
 
-        const max_record = try self.btree.get_max_cell();
+        const max_record = try self.btree.get_max_cell(self.btree.root);
         self.end_of_table = self.btree.empty or (page == max_record.page) and (cell == max_record.cell + 1);
     }
 
@@ -55,7 +55,11 @@ pub const Cursor = struct {
             .Leaf => {
                 const leaf_node = node.Leaf;
                 const num_cells = leaf_node.get_num_cells();
-                if (self.cell >= num_cells) {
+                const max_record = try self.btree.get_max_cell(self.btree.root);
+
+                if (self.page == max_record.page and self.cell == max_record.cell) {
+                    self.end_of_table = true;
+                } else if (self.cell == num_cells - 1) {
                     try self.set_position(leaf_node.get_next_node(), 0);
                 } else {
                     try self.set_position(self.page, self.cell + 1);
@@ -72,7 +76,7 @@ pub const Cursor = struct {
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !Cursor {
     var tree = try btree.init(io, allocator, file);
-    const max_record = try tree.get_max_cell();
+    const max_record = try tree.get_max_cell(tree.root);
     return Cursor{
         .btree = tree,
         .cell = 0,
