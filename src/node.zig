@@ -299,6 +299,13 @@ pub const InternalNode = struct {
         std.mem.writeInt(u32, destination[0..4], key, .little);
     }
 
+    pub fn get_child_ptr(self: *const InternalNode, index: u32) u32 {
+        const cell = self.get_cell(index);
+        std.debug.print("cell value - {x}\n", .{cell});
+        const destination = cell[ChildOffset .. ChildOffset + ChildSize];
+        return std.mem.readInt(u32, destination[0..4], .little);
+    }
+
     pub fn set_child_ptr(self: *InternalNode, child_ptr: u32, index: u32) void {
         const cell = self.get_cell(index);
         const destination = cell[ChildOffset .. ChildOffset + ChildSize];

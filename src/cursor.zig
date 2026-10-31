@@ -56,7 +56,8 @@ pub const Cursor = struct {
                 const leaf_node = node.Leaf;
                 const num_cells = leaf_node.get_num_cells();
                 const max_record = try self.btree.get_max_cell(self.btree.root);
-
+                std.debug.print("Max record - {d} --- {d}\n", .{ max_record.page, max_record.cell });
+                std.debug.print("Current record - {d} --- {d}\n", .{ self.page, self.cell });
                 if (self.page == max_record.page and self.cell == max_record.cell) {
                     self.end_of_table = true;
                 } else if (self.cell == num_cells - 1) {

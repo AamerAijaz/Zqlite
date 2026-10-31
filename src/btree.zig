@@ -49,7 +49,8 @@ pub const Btree = struct {
             .Leaf => Btree.find_leaf(node.Leaf, key),
             .Internal => {
                 const record = Btree.find_internal(node.Internal, key);
-                const page = node.Internal.get_key(record.cell);
+                const page = if (record.cell == node.Internal.get_num_cells()) node.Internal.get_right_child_ptr() else node.Internal.get_child_ptr(record.cell);
+                if (page == record.page) return error.CircularLoop;
                 const next_node = try self.get_node(page);
                 return self.find(next_node, key);
             },
@@ -120,6 +121,7 @@ pub const Btree = struct {
         // Initialize a new leaf node to act as the right node.
         var left_node = leaf;
         var right_node = (try self.get_node(self.pager.get_unusued_page())).Leaf;
+        const prev_max = left_node.get_key(left_node.get_num_cells() - 1);
 
         // Split and add the new cell between the left and right nodes.
         var index: u32 = LeafNode.MaxCells;
@@ -164,11 +166,25 @@ pub const Btree = struct {
 
             // Update the parent's pointers
             parent.set_right_child_ptr(right_node.base.page_index);
-            parent.set_num_cells(parent.get_num_cells() + 1);
             const left_max_key = left_node.get_key(left_node.get_num_cells() - 1);
             parent.add_cell(0, left_max_key, left_node.base.page_index);
         } else {
-            return AddError.NotImplemented;
+            parent = (try self.get_node(parent_index)).Internal;
+            const cur_max = left_node.get_key(left_node.get_num_cells() - 1);
+
+            // Set the next node of the left-node to be the right node.
+            right_node.set_next_node(left_node.get_next_node());
+            left_node.set_next_node(right_node.base.page_index);
+
+            // Update the parents of the left and right nodes.
+            left_node.base.set_parent(parent.base.page_index);
+            right_node.base.set_parent(parent.base.page_index);
+
+            // We now want to update the parent's cells.
+            // Since the keys have been split, the max of the left node has changed.
+            // The values must be updated in the parent node accordingly.
+            parent.set_key(cur_max, Btree.find_internal(parent, prev_max).cell);
+            try self.add_internal_cell(&parent, right_node);
         }
     }
 
@@ -241,6 +257,37 @@ pub const Btree = struct {
             .Internal => {
                 return AddError.NotImplemented;
             },
+        }
+    }
+
+    pub fn add_internal_cell(self: *Btree, internal: *InternalNode, leaf: LeafNode) !void {
+        const max_key = try self.get_max_key(.{ .Leaf = leaf });
+        const record = Btree.find_internal(internal.*, max_key);
+        const num_cells = internal.get_num_cells();
+
+        if (num_cells >= InternalNode.MaxCells) {
+            return AddError.NotImplemented;
+        }
+
+        const right_child_ptr = internal.get_right_child_ptr();
+        const right_child = try self.get_node(right_child_ptr);
+        const right_child_max_key = try self.get_max_key(right_child);
+        if (max_key > right_child_max_key) {
+            internal.set_child_ptr(right_child_ptr, num_cells);
+            internal.set_key(right_child_ptr, num_cells);
+            internal.set_right_child_ptr(leaf.base.page_index);
+            internal.set_num_cells(num_cells + 1);
+        } else {
+            var index = num_cells;
+            while (index > record.cell) : (index -= 1) {
+                const source = internal.get_cell(index - 1);
+                const destination = internal.get_cell(index);
+                @memmove(destination, source);
+
+                if (index == 0) break;
+            }
+
+            internal.add_cell(record.cell, max_key, leaf.base.page_index);
         }
     }
 };
