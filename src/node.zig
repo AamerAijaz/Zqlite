@@ -256,6 +256,15 @@ pub const InternalNode = struct {
         return internal;
     }
 
+    pub fn new_internal_node(base: BaseNode) InternalNode {
+        var internal = InternalNode{ .base = base };
+        internal.base.set_node_type(NodeType.Internal);
+        internal.base.set_parent(BaseNode.InvalidPageNum);
+        internal.set_num_cells(0);
+        internal.set_right_child_ptr(BaseNode.InvalidPageNum);
+        return internal;
+    }
+
     pub fn get_num_cells(self: *const InternalNode) u32 {
         std.debug.assert(self.base.page.len >= HeaderSize);
         const destination = self.base.peek(NumCellsOffset, NumCellsOffset + NumCellsSize);
@@ -301,7 +310,6 @@ pub const InternalNode = struct {
 
     pub fn get_child_ptr(self: *const InternalNode, index: u32) u32 {
         const cell = self.get_cell(index);
-        std.debug.print("cell value - {x}\n", .{cell});
         const destination = cell[ChildOffset .. ChildOffset + ChildSize];
         return std.mem.readInt(u32, destination[0..4], .little);
     }
@@ -318,5 +326,11 @@ pub const InternalNode = struct {
         self.set_key(key, index);
         self.set_child_ptr(child_ptr, index);
         self.set_num_cells(num_cells + 1);
+    }
+
+    pub fn move_cells(destination: InternalNode, source: InternalNode) void {
+        const dest_buf = destination.base.page[BaseNode.CommonHeaderSize..];
+        const source_buf = source.base.page[BaseNode.CommonHeaderSize..];
+        @memmove(dest_buf, source_buf);
     }
 };

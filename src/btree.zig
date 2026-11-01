@@ -184,7 +184,7 @@ pub const Btree = struct {
             // Since the keys have been split, the max of the left node has changed.
             // The values must be updated in the parent node accordingly.
             parent.set_key(cur_max, Btree.find_internal(parent, prev_max).cell);
-            try self.add_internal_cell(&parent, right_node);
+            try self.add_internal_cell(&parent, .{ .Leaf = right_node });
         }
     }
 
@@ -260,22 +260,32 @@ pub const Btree = struct {
         }
     }
 
-    pub fn add_internal_cell(self: *Btree, internal: *InternalNode, leaf: LeafNode) !void {
-        const max_key = try self.get_max_key(.{ .Leaf = leaf });
+    pub fn add_internal_cell(self: *Btree, internal: *InternalNode, node: Node) anyerror!void {
+        const max_key = try self.get_max_key(node);
         const record = Btree.find_internal(internal.*, max_key);
         const num_cells = internal.get_num_cells();
+        const child_page_index = switch (node) {
+            .Leaf => node.Leaf.base.page_index,
+            .Internal => node.Internal.base.page_index,
+        };
 
         if (num_cells >= InternalNode.MaxCells) {
-            return AddError.NotImplemented;
+            try self.split_and_add_internal_cell(internal, node);
+            return;
         }
 
         const right_child_ptr = internal.get_right_child_ptr();
+        if (right_child_ptr == BaseNode.InvalidPageNum) {
+            internal.set_right_child_ptr(child_page_index);
+            return;
+        }
+
         const right_child = try self.get_node(right_child_ptr);
         const right_child_max_key = try self.get_max_key(right_child);
         if (max_key > right_child_max_key) {
             internal.set_child_ptr(right_child_ptr, num_cells);
             internal.set_key(right_child_ptr, num_cells);
-            internal.set_right_child_ptr(leaf.base.page_index);
+            internal.set_right_child_ptr(child_page_index);
             internal.set_num_cells(num_cells + 1);
         } else {
             var index = num_cells;
@@ -287,7 +297,122 @@ pub const Btree = struct {
                 if (index == 0) break;
             }
 
-            internal.add_cell(record.cell, max_key, leaf.base.page_index);
+            internal.add_cell(record.cell, max_key, child_page_index);
+        }
+    }
+
+    pub fn split_and_add_internal_cell(self: *Btree, internal: *InternalNode, node: Node) anyerror!void {
+        var prev_internal_node = internal.*;
+        var parent: InternalNode = undefined;
+        var new_internal_node: InternalNode = undefined;
+        const prev_max = try self.get_max_key(.{ .Internal = prev_internal_node });
+        const child_max = try self.get_max_key(node);
+        var child_node = node;
+
+        const splitting_root = prev_internal_node.base.is_root();
+        if (splitting_root) {
+            try self.create_new_root();
+            parent = self.root.Internal;
+            prev_internal_node = (try self.get_node(parent.get_child_ptr(0))).Internal;
+            new_internal_node = (try self.get_node(parent.get_right_child_ptr())).Internal;
+        } else {
+            parent = (try self.get_node(prev_internal_node.base.get_parent())).Internal;
+            const new_node = try self.get_node(self.pager.get_unusued_page());
+            new_internal_node = InternalNode.new_internal_node(new_node.Leaf.base);
+        }
+
+        var cur = try self.get_node(prev_internal_node.get_right_child_ptr());
+        try self.add_internal_cell(&new_internal_node, cur);
+        switch (cur) {
+            .Leaf => cur.Leaf.base.set_parent(new_internal_node.base.page_index),
+            .Internal => cur.Internal.base.set_parent(new_internal_node.base.page_index),
+        }
+        prev_internal_node.set_right_child_ptr(BaseNode.InvalidPageNum);
+
+        var index: u32 = InternalNode.MaxCells - 1;
+        while (index > InternalNode.MaxCells / 2) : (index -= 1) {
+            cur = try self.get_node(prev_internal_node.get_child_ptr(@intCast(index)));
+            try self.add_internal_cell(&new_internal_node, cur);
+            switch (cur) {
+                .Leaf => cur.Leaf.base.set_parent(new_internal_node.base.page_index),
+                .Internal => cur.Internal.base.set_parent(new_internal_node.base.page_index),
+            }
+            prev_internal_node.set_num_cells(prev_internal_node.get_num_cells() - 1);
+        }
+
+        prev_internal_node.set_right_child_ptr(prev_internal_node.get_child_ptr(prev_internal_node.get_num_cells() - 1));
+        prev_internal_node.set_num_cells(prev_internal_node.get_num_cells() - 1);
+
+        const max_after_split = try self.get_max_key(.{ .Internal = prev_internal_node });
+        var destination_node = if (child_max < max_after_split) prev_internal_node else new_internal_node;
+        try self.add_internal_cell(&destination_node, node);
+        switch (child_node) {
+            .Leaf => child_node.Leaf.base.set_parent(destination_node.base.page_index),
+            .Internal => child_node.Internal.base.set_parent(destination_node.base.page_index),
+        }
+
+        parent.set_key(prev_max, Btree.find_internal(parent, try self.get_max_key(.{ .Internal = prev_internal_node })).cell);
+        if (!splitting_root) {
+            var parent_internal_node = (try self.get_node(prev_internal_node.base.get_parent())).Internal;
+            try self.add_internal_cell(&parent_internal_node, .{ .Internal = new_internal_node });
+            new_internal_node.base.set_parent(prev_internal_node.base.get_parent());
+        }
+    }
+
+    pub fn create_new_root(self: *Btree) !void {
+        var root = self.root;
+        const left_node = try self.get_node(self.pager.get_unusued_page());
+        const right_node = try self.get_node(self.pager.get_unusued_page());
+
+        switch (root) {
+            .Leaf => {
+                std.debug.print("We need to refactor the split_and_add to call the create_new_root method\n", .{});
+                return;
+            },
+            .Internal => {
+                var left_internal_node = InternalNode.new_internal_node(left_node.Leaf.base);
+                var right_internal_node = InternalNode.new_internal_node(right_node.Leaf.base);
+
+                @memmove(left_internal_node.base.page, root.Internal.base.page);
+                left_internal_node.base.set_root(false);
+
+                var child: Node = undefined;
+                for (0..left_internal_node.get_num_cells()) |index| {
+                    child = try self.get_node(left_internal_node.get_child_ptr(@intCast(index)));
+                    switch (child) {
+                        .Internal => {
+                            child.Internal.base.set_parent(left_internal_node.base.page_index);
+                        },
+                        .Leaf => {
+                            child.Leaf.base.set_parent(left_internal_node.base.page_index);
+                        },
+                    }
+                }
+                child = try self.get_node(left_internal_node.get_right_child_ptr());
+                switch (child) {
+                    .Internal => {
+                        child.Internal.base.set_parent(left_internal_node.base.page_index);
+                    },
+                    .Leaf => {
+                        child.Leaf.base.set_parent(left_internal_node.base.page_index);
+                    },
+                }
+
+                root.Internal.base.set_node_type(NodeType.Internal);
+                root.Internal.base.set_parent(BaseNode.InvalidPageNum);
+                root.Internal.set_num_cells(0);
+                root.Internal.set_right_child_ptr(BaseNode.InvalidPageNum);
+
+                root.Internal.set_num_cells(1);
+                root.Internal.set_child_ptr(left_internal_node.base.page_index, 0);
+                root.Internal.set_key(try self.get_max_key(.{ .Internal = left_internal_node }), 0);
+                root.Internal.set_right_child_ptr(right_internal_node.base.page_index);
+
+                self.root = root;
+
+                left_internal_node.base.set_parent(root.Internal.base.page_index);
+                right_internal_node.base.set_parent(root.Internal.base.page_index);
+            },
         }
     }
 };
